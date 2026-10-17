@@ -41,5 +41,26 @@ With the delayed key, prices returned by later calls lag the live market.
 ## Tests
 
 ```bash
-python -m unittest racing.test_config
+python -m unittest racing.test_config racing.test_results
 ```
+
+## Download a day's results
+
+```bash
+python -m racing.results                     # today (UTC)
+python -m racing.results --date 2026-10-17   # a chosen day
+```
+
+This writes `racing/data/results-<date>.csv` with one row per runner in every
+settled WIN market: date, course, market time (UTC), market id, race name,
+selection id, runner, BSP, result (`WINNER`, `LOSER` or `REMOVED`) and whether
+it was a non-runner. Races that haven't been settled yet are left out until
+the next run. It places no bets.
+
+Betfair stops listing a market (with its course and runner names) once it
+closes, so each run saves that day's race card to
+`racing/data/racecard-<date>.json` and adds to it. Run it once before racing
+starts and again after the last race. Results stay available for settled
+markets for roughly 90 days, but only for days whose race card was saved.
+Older seasons come from the Betfair historical data files instead.
+`racing/data/` is gitignored.
