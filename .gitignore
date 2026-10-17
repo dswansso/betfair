@@ -29,3 +29,11 @@ nosetests.xml
 
 # IDE metafile ignores
 .idea
+
+# Local secrets (Betfair app key, login, certificates)
+.env
+racing/.env
+certs/
+*.pem
+*.crt
+*.key
