@@ -6,17 +6,18 @@ markets. It never places bets.
 
 ## Setup
 
-1. Install the dependencies from the repo root:
+1. From the repo root, create a virtual environment and install the library:
 
    ```bash
-   pip install -r requirements.txt
+   python -m venv .venv
+   source .venv/bin/activate      # Windows: .venv\Scripts\activate
    pip install -e .
    ```
 
 2. Copy the example settings and fill in your own details:
 
    ```bash
-   cp racing/.env.example racing/.env
+   cp racing/.env.example racing/.env      # Windows: copy racing\.env.example racing\.env
    ```
 
    `racing/.env` is gitignored. Keep your app key, username and password in
