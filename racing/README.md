@@ -64,3 +64,14 @@ starts and again after the last race. Results stay available for settled
 markets for roughly 90 days, but only for days whose race card was saved.
 Older seasons come from the Betfair historical data files instead.
 `racing/data/` is gitignored.
+
+### Run it automatically on Windows
+
+`run_results.bat` in the repo root runs the download and appends its output to
+`racing\data\log.txt`. Schedule it twice a day from Command Prompt (the PC has
+to be on and logged in at those times):
+
+```bat
+schtasks /create /tn "Betfair results morning" /tr "%CD%\run_results.bat" /sc daily /st 10:00
+schtasks /create /tn "Betfair results evening" /tr "%CD%\run_results.bat" /sc daily /st 22:00
+```
