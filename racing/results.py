@@ -1,16 +1,19 @@
 """
-Read-only results download: writes one CSV row per runner for a day's settled
-horse racing WIN markets, with BSP, result and non-runners. It places no bets.
+Read-only results download: writes one CSV row per runner for each day's
+settled horse racing WIN markets, with BSP, result and non-runners. It places
+no bets.
 
-    python -m racing.results                  # today (UTC)
+    python -m racing.results                  # races in the next 24 hours, plus recent days
     python -m racing.results --date 2026-10-17
 
 Betfair's listMarketCatalogue stops returning a market once it closes, so
 course and runner names have to be captured while the market is still open.
-Each run saves the day's race card to racing/data/racecard-<date>.json and
-adds to it, so run this once before racing starts and again after the last
-race. Results (listMarketBook) stay available for settled markets for
-roughly 90 days, but only for markets whose race card was saved.
+Each run saves every race starting in the next 24 hours to
+racing/data/racecard-<date>.json, filed by the race's local date at the
+course, then rewrites racing/data/results-<date>.csv for the last few days.
+Two runs a day about 12 hours apart cover every race. Results
+(listMarketBook) stay available for settled markets for roughly 90 days, but
+only for markets whose race card was saved.
 """
 
 import argparse
@@ -19,6 +22,7 @@ import datetime
 import json
 import os
 import sys
+import zoneinfo
 
 from betfairlightweight import filters
 from betfairlightweight.exceptions import BetfairError
@@ -31,9 +35,18 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 # listMarketBook allows a total request weight of 200; SP_TRADED weighs 7 per market.
 BOOK_CHUNK_SIZE = 25
 
+# Default runs save races starting up to this far ahead, and also catch races
+# that started recently but haven't settled yet.
+LOOKAHEAD = datetime.timedelta(hours=24)
+LOOKBACK = datetime.timedelta(hours=6)
+
+# Default runs rewrite the results of race days up to this many days old.
+RECENT_DAYS = 3
+
 CSV_COLUMNS = [
     "date",
     "course",
+    "country",
     "market_time_utc",
     "market_id",
     "market_name",
@@ -46,9 +59,27 @@ CSV_COLUMNS = [
 
 
 def day_window(day: datetime.date):
-    start = datetime.datetime.combine(day, datetime.time.min, datetime.timezone.utc)
-    end = start + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
-    return start, end
+    """Covers every course's local day for this date, from UTC+14 to UTC-12."""
+    midnight = datetime.datetime.combine(day, datetime.time.min, datetime.timezone.utc)
+    return midnight - datetime.timedelta(hours=14), midnight + datetime.timedelta(
+        hours=36
+    )
+
+
+def upcoming_window(now: datetime.datetime):
+    return now - LOOKBACK, now + LOOKAHEAD
+
+
+def race_date(market: dict) -> str:
+    """The race's date at the course, falling back to the UTC date if the time zone is unknown."""
+    start = datetime.datetime.fromisoformat(
+        market["marketStartTime"].replace("Z", "+00:00")
+    )
+    try:
+        zone = zoneinfo.ZoneInfo((market.get("event") or {}).get("timezone"))
+    except (zoneinfo.ZoneInfoNotFoundError, TypeError, ValueError):
+        zone = datetime.timezone.utc
+    return start.astimezone(zone).date().isoformat()
 
 
 def racecard_path(day: datetime.date) -> str:
@@ -72,6 +103,13 @@ def save_racecard(path: str, racecard: dict) -> None:
         json.dump(racecard, f, indent=1, sort_keys=True)
 
 
+def group_by_date(catalogues: list) -> dict:
+    by_date = {}
+    for market in catalogues:
+        by_date.setdefault(race_date(market), []).append(market)
+    return by_date
+
+
 def merge_catalogue(racecard: dict, catalogues: list) -> int:
     """Adds lightweight listMarketCatalogue results to the race card; returns how many were new."""
     added = 0
@@ -80,7 +118,9 @@ def merge_catalogue(racecard: dict, catalogues: list) -> int:
         if market["marketId"] not in racecard:
             added += 1
         racecard[market["marketId"]] = {
+            "date": race_date(market),
             "course": event.get("venue") or event.get("name"),
+            "country": event.get("countryCode"),
             "market_name": market.get("marketName"),
             "market_time_utc": market.get("marketStartTime"),
             "runners": {
@@ -103,8 +143,10 @@ def rows_from_books(racecard: dict, books: list) -> list:
             selection_id = str(runner["selectionId"])
             rows.append(
                 {
-                    "date": (market["market_time_utc"] or "")[:10],
+                    "date": market.get("date")
+                    or (market["market_time_utc"] or "")[:10],
                     "course": market["course"],
+                    "country": market.get("country") or "",
                     "market_time_utc": market["market_time_utc"],
                     "market_id": book["marketId"],
                     "market_name": market["market_name"],
@@ -127,22 +169,41 @@ def write_csv(path: str, rows: list) -> None:
         writer.writerows(rows)
 
 
-def fetch_catalogue(client, config, day: datetime.date) -> list:
-    start, end = day_window(day)
-    return client.betting.list_market_catalogue(
-        filter=filters.market_filter(
-            event_type_ids=[HORSE_RACING_EVENT_TYPE_ID],
-            market_countries=config.countries,
-            market_type_codes=["WIN"],
-            market_start_time=filters.time_range(
-                from_=start.isoformat(), to=end.isoformat()
-            ),
-        ),
-        market_projection=["EVENT", "MARKET_START_TIME", "RUNNER_DESCRIPTION"],
-        sort="FIRST_TO_START",
-        max_results=1000,
-        lightweight=True,
-    )
+def fetch_catalogue(client, config, start, end) -> list:
+    # One request per country keeps each response well inside Betfair's size limit.
+    markets = []
+    for country in config.countries:
+        markets.extend(
+            client.betting.list_market_catalogue(
+                filter=filters.market_filter(
+                    event_type_ids=[HORSE_RACING_EVENT_TYPE_ID],
+                    market_countries=[country],
+                    market_type_codes=["WIN"],
+                    market_start_time=filters.time_range(
+                        from_=start.isoformat(), to=end.isoformat()
+                    ),
+                ),
+                market_projection=["EVENT", "MARKET_START_TIME", "RUNNER_DESCRIPTION"],
+                sort="FIRST_TO_START",
+                max_results=200,
+                lightweight=True,
+            )
+        )
+    return markets
+
+
+def recent_card_dates(today: datetime.date) -> set:
+    """Dates of race cards already saved within the last RECENT_DAYS days."""
+    if not os.path.isdir(DATA_DIR):
+        return set()
+    oldest = (today - datetime.timedelta(days=RECENT_DAYS)).isoformat()
+    dates = set()
+    for name in os.listdir(DATA_DIR):
+        if name.startswith("racecard-") and name.endswith(".json"):
+            day = name[len("racecard-") : -len(".json")]
+            if day >= oldest:
+                dates.add(day)
+    return dates
 
 
 def fetch_books(client, market_ids: list) -> list:
@@ -165,10 +226,40 @@ def parse_args(argv):
     parser.add_argument(
         "--date",
         type=datetime.date.fromisoformat,
-        default=datetime.datetime.now(datetime.timezone.utc).date(),
-        help="race day as YYYY-MM-DD (UTC), default today",
+        help="one race day as YYYY-MM-DD (the course's local date); "
+        "default is races in the next 24 hours plus the last few days",
     )
     return parser.parse_args(argv)
+
+
+def update_day(client, day: str, new_markets: list) -> None:
+    card_file = racecard_path(datetime.date.fromisoformat(day))
+    racecard = load_racecard(card_file)
+    added = merge_catalogue(racecard, new_markets)
+    if not racecard:
+        print(
+            "%s: no race card saved. Betfair only lists races before they finish, "
+            "so this day can't be filled in now." % day
+        )
+        return
+    save_racecard(card_file, racecard)
+    rows = rows_from_books(racecard, fetch_books(client, sorted(racecard)))
+    settled = len({r["market_id"] for r in rows})
+    out_file = results_path(datetime.date.fromisoformat(day))
+    write_csv(out_file, rows)
+    print(
+        "%s: %s races saved (%s new), %s settled, %s still to come or unsettled. "
+        "Wrote %s runners to %s"
+        % (
+            day,
+            len(racecard),
+            added,
+            settled,
+            len(racecard) - settled,
+            len(rows),
+            out_file,
+        )
+    )
 
 
 def main(argv=None) -> int:
@@ -179,6 +270,12 @@ def main(argv=None) -> int:
         print(e, file=sys.stderr)
         return 1
 
+    if not zoneinfo.available_timezones():
+        print(
+            "Time zone data is missing, so races are filed by UTC date. "
+            "Run: pip install tzdata"
+        )
+
     client = create_client(config)
     try:
         login(client, config)
@@ -186,38 +283,28 @@ def main(argv=None) -> int:
         print("Login failed: %s" % e, file=sys.stderr)
         return 1
 
-    card_file = racecard_path(args.date)
-    racecard = load_racecard(card_file)
     try:
-        added = merge_catalogue(racecard, fetch_catalogue(client, config, args.date))
-        save_racecard(card_file, racecard)
-        print(
-            "Race card for %s: %s WIN markets saved (%s new)."
-            % (args.date, len(racecard), added)
-        )
-        books = fetch_books(client, sorted(racecard)) if racecard else []
+        if args.date:
+            by_date = group_by_date(
+                fetch_catalogue(client, config, *day_window(args.date))
+            )
+            days = {args.date.isoformat()}
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            by_date = group_by_date(
+                fetch_catalogue(client, config, *upcoming_window(now))
+            )
+            days = set(by_date) | recent_card_dates(now.date())
+        for day in sorted(days):
+            update_day(client, day, by_date.get(day, []))
     except BetfairError as e:
         print("Request failed: %s" % e, file=sys.stderr)
         return 1
     finally:
         client.logout()
 
-    if not racecard:
-        print(
-            "No race card saved for %s. Betfair only lists markets before they "
-            "close, so run this on the day before racing finishes." % args.date
-        )
-        return 0
-
-    rows = rows_from_books(racecard, books)
-    settled = len({r["market_id"] for r in rows})
-    out_file = results_path(args.date)
-    write_csv(out_file, rows)
-    print(
-        "%s races settled, %s still to come or unsettled."
-        % (settled, len(racecard) - settled)
-    )
-    print("Wrote %s runners to %s" % (len(rows), out_file))
+    if not days:
+        print("No races found for %s." % ", ".join(config.countries))
     return 0
 
 
